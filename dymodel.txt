@@ -1,0 +1,534 @@
+from typing import Type
+import sys
+sys.path.append('D:/env/CoPo/copo_code')
+import gym
+import numpy as np
+from gym.spaces import Box
+import torch.nn.functional as F
+from typing import Dict, List, Union
+from copo.torch_copo.algo_ippo import IPPOTrainer, IPPOConfig
+from copo.torch_copo.utils.callbacks import MultiAgentDrivingCallbacks
+#from ray.rllib.evaluation.postprocessing import discount_cumsum
+from copo.torch_copo.utils.env_wrappers import get_dyenv, get_rllib_compatible_env
+from copo.torch_copo.utils.train import train
+from copo.torch_copo.utils.utils import get_train_parser
+from ray import tune
+from ray.rllib.algorithms.ppo.ppo_torch_policy import PPOTorchPolicy
+from ray.rllib.evaluation.postprocessing import Postprocessing
+from ray.rllib.evaluation.postprocessing import compute_advantages
+from ray.rllib.models.catalog import ModelCatalog
+from ray.rllib.models.torch.misc import SlimFC, AppendBiasLayer, normc_initializer
+from ray.rllib.models.torch.torch_modelv2 import TorchModelV2
+from ray.rllib.policy.policy import Policy
+from ray.rllib.policy.sample_batch import SampleBatch
+from ray.rllib.policy.view_requirement import ViewRequirement
+from ray.rllib.utils.annotations import override
+from ray.rllib.utils.framework import try_import_torch
+from ray.rllib.utils.torch_utils import convert_to_torch_tensor
+from ray.rllib.utils.torch_utils import (
+    explained_variance,
+    sequence_mask,
+    warn_if_infinite_kl_divergence,
+)
+from ray.rllib.utils.typing import ModelConfigDict, TensorType, TrainerConfigDict
+from ray.rllib.models.utils import get_activation_fn
+from typing import Union, Tuple, Any, List
+torch, nn = try_import_torch()
+
+LCF_PARAMETERS = "lcf_parameters"
+CENTRALIZED_CRITIC_OBS = "centralized_critic_obs"
+NEI_REWARDS = "nei_rewards"
+COORDINATED_REWARDS = "coordinated_rewards"
+
+class SlimFC1(nn.Module):
+    """Simple PyTorch version of `linear` function"""
+
+    def __init__(
+        self,
+        in_size: int,
+        out_size: int,
+        initializer: Any = None,
+        activation_fn: Any = None,
+        use_bias: bool = True,
+        bias_init: float = 0.0,
+    ):
+        """Creates a standard FC layer, similar to torch.nn.Linear
+
+        Args:
+            in_size: Input size for FC Layer
+            out_size: Output size for FC Layer
+            initializer: Initializer function for FC layer weights
+            activation_fn: Activation function at the end of layer
+            use_bias: Whether to add bias weights or not
+            bias_init: Initalize bias weights to bias_init const
+        """
+        super(SlimFC1, self).__init__()
+        layers = []
+        # Actual nn.Linear layer (including correct initialization logic).
+        linear = nn.Linear(in_size, out_size, bias=use_bias)
+        if initializer is None:
+            initializer = nn.init.xavier_uniform_
+        initializer(linear.weight)
+        if use_bias is True:
+            nn.init.constant_(linear.bias, bias_init)
+        layers.append(linear)
+        # Activation function (if any; default=None (linear)).
+        if isinstance(activation_fn, str):
+            activation_fn = get_activation_fn(activation_fn, "torch")
+        if activation_fn is not None:
+            layers.append(nn.BatchNorm1d(out_size))
+            layers.append(activation_fn())
+        # Put everything in sequence.
+        self._model = nn.Sequential(*layers)
+
+    def forward(self, x: TensorType) -> TensorType:
+        return self._model(x)
+class DYPPOConfig(IPPOConfig):
+    def __init__(self, algo_class=None):
+        super().__init__(algo_class=algo_class or DYPPOTrainer)
+        self.counterfactual = False
+        self.old_value_loss = True
+        self.lcf_mode = 'angle'
+        self.update_from_dict({"model": {"custom_model": "dy_model"}})
+
+    def validate(self):
+        super().validate()
+
+
+
+
+class DYModel(TorchModelV2, nn.Module):
+    """Multi-agent model that implements a centralized VF."""
+    def __init__(
+        self, obs_space: gym.spaces.Space, action_space: gym.spaces.Space, num_outputs: int,
+        model_config: ModelConfigDict, name: str
+    ):
+
+        TorchModelV2.__init__(self, obs_space, action_space, num_outputs, model_config, name)
+        nn.Module.__init__(self)
+        self.lcf_parameters = None
+        self.obs_concat = None
+        hiddens = list(model_config.get("fcnet_hiddens", [])) + list(model_config.get("post_fcnet_hiddens", []))
+        activation = model_config.get("fcnet_activation")  #tanh
+        svo_obs = int(np.product(obs_space.shape))
+        self.dysvo_network = self.build_one_value_network(
+            in_size=svo_obs, activation=activation,hiddens=hiddens)
+        if not model_config.get("fcnet_hiddens", []):
+            activation = model_config.get("post_fcnet_activation")
+        no_final_linear = model_config.get("no_final_linear") # False
+        self.vf_share_layers = model_config.get("vf_share_layers") # False
+        self.free_log_std = model_config.get("free_log_std") # False
+        # Generate free-floating bias variables for the second half of
+        # the outputs.
+        if self.free_log_std:
+            assert num_outputs % 2 == 0, (
+                "num_outputs must be divisible by two",
+                num_outputs,
+            )
+            num_outputs = num_outputs // 2
+
+        layers = []
+        prev_layer_size = int(np.product(obs_space.shape))+1
+        self._logits = None
+
+
+        # Create layers 0 to second-last.
+        for size in hiddens[:-1]:
+            layers.append(
+                SlimFC(
+                    in_size=prev_layer_size,
+                    out_size=size,
+                    initializer=normc_initializer(1.0),
+                    activation_fn=activation
+                )
+            )
+            prev_layer_size = size
+
+        # The last layer is adjusted to be of size num_outputs, but it's a
+        # layer with activation.
+        if no_final_linear and num_outputs:
+            layers.append(
+                SlimFC(
+                    in_size=prev_layer_size,
+                    out_size=num_outputs,
+                    initializer=normc_initializer(1.0),
+                    activation_fn=activation
+                )
+            )
+            prev_layer_size = num_outputs
+        # Finish the layers with the provided sizes (`hiddens`), plus -
+        # iff num_outputs > 0 - a last linear layer of size num_outputs.
+        else:
+            if len(hiddens) > 0:
+                layers.append(
+                    SlimFC(
+                        in_size=prev_layer_size,
+                        out_size=hiddens[-1],
+                        initializer=normc_initializer(1.0),
+                        activation_fn=activation
+                    )
+                )
+                prev_layer_size = hiddens[-1]
+            if num_outputs:
+                self._logits = SlimFC(
+                    in_size=prev_layer_size,
+                    out_size=num_outputs,
+                    initializer=normc_initializer(0.01),
+                    activation_fn=None
+                )
+            else:
+                self.num_outputs = ([int(np.product(obs_space.shape))] + hiddens[-1:])[-1]
+
+        # Layer to add the log std vars to the state-dependent means.
+        if self.free_log_std and self._logits:
+            self._append_free_log_std = AppendBiasLayer(num_outputs)
+
+        self._hidden_layers = nn.Sequential(*layers)
+
+        self._value_branch_separate = None
+        if not self.vf_share_layers:
+            # Build a parallel set of hidden layers for the value net.
+
+            # ========== Our Modification ==========
+            # Note: We use centralized critic obs size as the input size of critic!
+            prev_vf_layer_size = int(np.product(obs_space.shape))+1
+            assert prev_vf_layer_size > 0
+
+            vf_layers = []
+            for size in hiddens:
+                vf_layers.append(
+                    SlimFC(
+                        in_size=prev_vf_layer_size,
+                        out_size=size,
+                        activation_fn=activation,
+                        initializer=normc_initializer(1.0)
+                    )
+                )
+                prev_vf_layer_size = size
+            self._value_branch_separate = nn.Sequential(*vf_layers)
+
+        self._value_branch = SlimFC(
+            in_size=prev_vf_layer_size, out_size=1, initializer=normc_initializer(0.01), activation_fn=None
+        )
+
+        self.view_requirements[LCF_PARAMETERS] = ViewRequirement(
+            space=Box(obs_space.low[0], obs_space.high[0], shape=(1,))
+        )
+        self.view_requirements[CENTRALIZED_CRITIC_OBS] = ViewRequirement(
+            space=Box(obs_space.low[0], obs_space.high[0], shape=(svo_obs+1, ))
+        )
+        self.view_requirements[NEI_REWARDS] = ViewRequirement()
+        self.view_requirements[COORDINATED_REWARDS] = ViewRequirement()
+        self.view_requirements[SampleBatch.ACTIONS] = ViewRequirement(space=action_space)
+
+    def build_one_value_network(self, in_size, activation, hiddens):
+        assert in_size > 0
+        svo_layers = []
+        for size in hiddens:
+            svo_layers.append(
+                SlimFC1(in_size=in_size, out_size=size, activation_fn=activation, initializer=normc_initializer(1.0))
+            )
+            svo_layers.append(nn.Dropout(0.5))
+            in_size = size
+
+        svo_layers.append(SlimFC(in_size=in_size, out_size=1, initializer=normc_initializer(0.01) ,activation_fn=activation))
+
+        #svo_layers.append(nn.Sigmoid())
+        return nn.Sequential(*svo_layers)
+
+    @override(TorchModelV2)
+    def forward(self, input_dict, state, seq_lens):
+        obs = input_dict["obs_flat"].float()
+        obs = obs.reshape(obs.shape[0], -1)
+        self.lcf_parameters = self.dysvo_network(obs)
+        mean = torch.mean(self.lcf_parameters)
+        self.obs_concat = torch.cat([obs, self.lcf_parameters], dim=1)
+        features = self._hidden_layers(self.obs_concat)
+        logits = self._logits(features) if self._logits else self._features
+        if self.free_log_std:
+            logits = self._append_free_log_std(logits)
+        return logits, state,
+
+
+
+    def central_value_function(self, obs):
+        assert self._value_branch is not None
+        return torch.reshape(self._value_branch(self._value_branch_separate(obs)), [-1])
+
+
+ModelCatalog.register_custom_model("dy_model", DYModel)
+
+
+def get_dyppo_env(env_class):
+    return get_rllib_compatible_env(get_dyenv(env_class))
+
+
+def discount_cumsum(x: torch.Tensor, gamma: float) -> torch.Tensor:
+    """Calculates the discounted cumulative sum over a reward sequence `x`.
+
+    y[t] - discount*y[t+1] = x[t]
+    reversed(y)[t] - discount*reversed(y)[t-1] = reversed(x)[t]
+
+    Args:
+        gamma: The discount factor gamma.
+
+    Returns:
+        The sequence containing the discounted cumulative sums
+        for each individual reward in `x` till the end of the trajectory.
+    """
+    T = len(x)
+    discounts = torch.tensor([gamma ** i for i in range(T)])
+    discounted_cumsum = torch.zeros_like(x)
+    for t in range(T):
+        discounted_cumsum[t] = (x[t:] * discounts[:T - t]).sum()
+    return discounted_cumsum
+
+
+def standardized(tensor: torch.Tensor):
+    """Normalize the values in a tensor.
+
+    Args:
+        tensor (torch.Tensor): Tensor of values to normalize.
+
+    Returns:
+        torch.Tensor with zero mean and unit standard deviation.
+    """
+    mean = tensor.mean()
+    std = tensor.std()
+    # 防止除以零
+    std = max(1e-4, std)
+    return (tensor - mean) / std
+
+
+def compute_separated_advantages(train_batch, gamma=0.99, lambda_=0.95):
+    agent_indices = train_batch["agent_index"]
+    unique_agents, counts = torch.unique_consecutive(agent_indices, return_counts=True)
+
+    start_idx = 0
+    all_advantages = []
+    all_value_targets = []
+
+    for agent_id, count in zip(unique_agents, counts):
+        end_idx = start_idx + count
+
+        # 直接使用Tensor切片
+        agent_rewards = train_batch["coordinated_rewards"][start_idx:end_idx]
+        agent_dones = train_batch["dones"][start_idx:end_idx]
+        agent_values = train_batch["vf_preds"][start_idx:end_idx]
+
+        # 计算最后一个reward的处理
+        last_r = 0.0 if agent_dones[-1] else agent_values[-1]
+
+        # 延展value predictions
+        vpred_t = torch.cat((agent_values, torch.tensor([last_r], device=agent_values.device, dtype=torch.float32)),
+                            dim=0)
+        delta_t = agent_rewards + gamma * vpred_t[1:] - vpred_t[:-1]
+
+        # 计算优势
+        advantages = discount_cumsum(delta_t, gamma * lambda_)
+        value_targets = advantages + agent_values
+
+        # 存储计算结果
+        all_advantages.append(advantages)
+        all_value_targets.append(value_targets)
+
+        start_idx = end_idx
+
+    # 将列表中的所有Tensor拼接成一个Tensor
+    train_batch["advantages"] = standardized(torch.cat(all_advantages, dim=0))
+    train_batch["value_targets"] = torch.cat(all_value_targets, dim=0).detach()
+
+    return train_batch
+
+
+class DYPPOPolicy(PPOTorchPolicy):
+    def extra_action_out(self, input_dict, state_batches, model, action_dist):
+        # Ensure lcf_parameters are computed and added to outputs
+        if not hasattr(model, 'lcf_parameters'):
+            raise ValueError("Model does not have lcf_parameters attribute.")
+        extra_info = {
+            "lcf_parameters": model.lcf_parameters.detach().cpu().numpy()
+        }
+        return extra_info
+   # SampleBatch(200: ['obs', 'actions', 'rewards', 'dones', 'infos', 't', 'eps_id', 'unroll_id', 'agent_index', 'action_dist_inputs', 'action_logp'])
+    def postprocess_trajectory(self, sample_batch, other_agent_batches=None, episode=None):
+        with torch.no_grad():
+            # print("other_agent_batches",other_agent_batches)
+            o = sample_batch[SampleBatch.CUR_OBS]
+            sample_batch[CENTRALIZED_CRITIC_OBS] = np.concatenate((o, sample_batch[LCF_PARAMETERS]), axis=1)
+            sample_batch[SampleBatch.VF_PREDS] = self.model.central_value_function(
+                convert_to_torch_tensor(sample_batch[CENTRALIZED_CRITIC_OBS], self.device)
+            ).cpu().detach().numpy().astype(np.float32)
+            infos = sample_batch.get(SampleBatch.INFOS)
+            if episode is not None:  # After initialization
+                assert isinstance(infos[0], dict)
+                # Modified: when initialized, add neighborhood/global rewardalue
+                sample_batch[NEI_REWARDS] = np.array([info[NEI_REWARDS] for info in infos]).astype(np.float32)
+        return sample_batch
+
+    def loss(self, model, dist_class, train_batch):
+        """
+        Compute loss for Proximal Policy Objective.
+
+        PZH: We replace the value function here so that we query the centralized values instead
+        of the native value function.
+        """
+        logits, state= model(train_batch)
+        lcf_parameters = self.model.lcf_parameters
+        if self.config["lcf_mode"] == "linear":
+            train_batch[COORDINATED_REWARDS] = (1 - lcf_parameters).squeeze() * train_batch[SampleBatch.REWARDS] + \
+                                               lcf_parameters.squeeze() * train_batch[NEI_REWARDS]
+        elif self.config["lcf_mode"] == "angle":
+            lcf_rad = (lcf_parameters.squeeze()+1) * np.pi / 4
+            train_batch[COORDINATED_REWARDS] = torch.cos(lcf_rad) * train_batch[SampleBatch.REWARDS] + \
+                                               torch.sin(lcf_rad) * train_batch[NEI_REWARDS]
+
+        train_batch = compute_separated_advantages(
+            train_batch,
+            self.config["gamma"],
+            self.config["lambda"],
+        )
+        curr_action_dist = dist_class(logits, model)
+
+        # RNN case: Mask away 0-padded chunks at end of time axis.
+        if state:
+            B = len(train_batch[SampleBatch.SEQ_LENS])
+            max_seq_len = logits.shape[0] // B
+            mask = sequence_mask(
+                train_batch[SampleBatch.SEQ_LENS],
+                max_seq_len,
+                time_major=model.is_time_major(),
+            )
+            mask = torch.reshape(mask, [-1])
+            num_valid = torch.sum(mask)
+
+            def reduce_mean_valid(t):
+                return torch.sum(t[mask]) / num_valid
+
+        # non-RNN case: No masking.
+        else:
+            mask = None
+            reduce_mean_valid = torch.mean
+
+        prev_action_dist = dist_class(train_batch[SampleBatch.ACTION_DIST_INPUTS], model)
+
+        logp_ratio = torch.exp(
+            curr_action_dist.logp(train_batch[SampleBatch.ACTIONS]) - train_batch[SampleBatch.ACTION_LOGP]
+        )
+
+        # Only calculate kl loss if necessary (kl-coeff > 0.0).
+        if self.config["kl_coeff"] > 0.0:
+            action_kl = prev_action_dist.kl(curr_action_dist)
+            mean_kl_loss = reduce_mean_valid(action_kl)
+            warn_if_infinite_kl_divergence(self, mean_kl_loss)
+        else:
+            mean_kl_loss = torch.tensor(0.0, device=logp_ratio.device)
+
+        curr_entropy = curr_action_dist.entropy()
+        mean_entropy = reduce_mean_valid(curr_entropy)
+
+        surrogate_loss = torch.min(
+            train_batch[Postprocessing.ADVANTAGES] * logp_ratio,
+            train_batch[Postprocessing.ADVANTAGES] *
+            torch.clamp(logp_ratio, 1 - self.config["clip_param"], 1 + self.config["clip_param"]),
+        )
+
+        # Compute a value function loss.
+        assert self.config["use_critic"]
+
+        # ========== Modification ==========
+        # value_fn_out = model.value_function()
+        value_fn_out = self.model.central_value_function(self.model.obs_concat)
+        # ========== Modification Ends ==========
+
+        if self.config["old_value_loss"]:
+            current_vf = value_fn_out
+            prev_vf = train_batch[SampleBatch.VF_PREDS]
+            vf_loss1 = torch.pow(current_vf - train_batch[Postprocessing.VALUE_TARGETS], 2.0)
+            vf_clipped = prev_vf + torch.clamp(
+                current_vf - prev_vf, -self.config["vf_clip_param"], self.config["vf_clip_param"]
+            )
+            vf_loss2 = torch.pow(vf_clipped - train_batch[Postprocessing.VALUE_TARGETS], 2.0)
+            vf_loss_clipped = torch.max(vf_loss1, vf_loss2)
+        else:
+            vf_loss = torch.pow(value_fn_out - train_batch[Postprocessing.VALUE_TARGETS], 2.0)
+            vf_loss_clipped = torch.clamp(vf_loss, 0, self.config["vf_clip_param"])
+        mean_vf_loss = reduce_mean_valid(vf_loss_clipped)
+
+        total_loss = reduce_mean_valid(
+            -surrogate_loss + self.config["vf_loss_coeff"] * vf_loss_clipped - self.entropy_coeff * curr_entropy
+        )
+
+        # Add mean_kl_loss (already processed through `reduce_mean_valid`),
+        # if necessary.
+        if self.config["kl_coeff"] > 0.0:
+            total_loss += self.kl_coeff * mean_kl_loss
+
+        # Store values for stats function in model (tower), such that for
+        # multi-GPU, we do not override them during the parallel loss phase.
+        model.tower_stats["total_loss"] = total_loss
+        model.tower_stats["mean_policy_loss"] = reduce_mean_valid(-surrogate_loss)
+        model.tower_stats["mean_vf_loss"] = mean_vf_loss
+        model.tower_stats["vf_explained_var"] = explained_variance(
+            train_batch[Postprocessing.VALUE_TARGETS], value_fn_out
+        )
+        model.tower_stats["mean_entropy"] = mean_entropy
+        model.tower_stats["mean_kl_loss"] = mean_kl_loss
+
+        return total_loss
+
+
+class DYPPOTrainer(IPPOTrainer):
+    @classmethod
+    def get_default_config(cls):
+        return DYPPOConfig()
+
+    def get_default_policy_class(self, config: TrainerConfigDict) -> Type[Policy]:
+        assert config["framework"] == "torch"
+        return DYPPOPolicy
+
+
+def _test():
+    # Testing only!
+    from copo.torch_copo.utils.callbacks import MultiAgentDrivingCallbacks
+    from copo.torch_copo.utils.train import train
+    from copo.torch_copo.utils.utils import get_train_parser
+    from metadrive.envs.marl_envs import MultiAgentIntersectionEnv
+    from copo.torch_copo.utils.env_wrappers import get_lcf_env, get_rllib_compatible_env
+
+    parser = get_train_parser()
+    args = parser.parse_args()
+    stop = {"timesteps_total": 200_0000}
+    exp_name = "test_mappo" if not args.exp_name else args.exp_name
+    config = dict(
+        env=get_rllib_compatible_env(get_lcf_env(MultiAgentIntersectionEnv)),
+        env_config=dict(
+            start_seed=tune.grid_search([5000]),
+            num_agents=10,
+            neighbours_distance=40
+        ),
+        num_sgd_iter=1,
+        lcf_mode="linear",
+        rollout_fragment_length=100,
+        train_batch_size=200,
+        sgd_minibatch_size=128,
+        num_workers=0,
+    )
+    results = train(
+        DYPPOTrainer,
+        config=config,  # Do not use validate_config_add_multiagent here!
+        checkpoint_freq=0,  # Don't save checkpoint is set to 0.
+        keep_checkpoints_num=0,
+        stop=stop,
+        num_gpus=args.num_gpus,
+        num_seeds=1,
+        max_failures=0,
+        exp_name=exp_name,
+        custom_callback=MultiAgentDrivingCallbacks,
+        test_mode=True,
+        local_mode=True
+    )
+
+
+if __name__ == "__main__":
+    _test()
